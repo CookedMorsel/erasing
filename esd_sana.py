@@ -4,34 +4,37 @@ import sys
 import random
 from tqdm.auto import tqdm
 from safetensors.torch import save_file
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import SanaPipeline
+from diffusers.models import SanaTransformer2DModel
 import argparse
 
 sys.path.append('.')
-from utils.sd_utils import esd_sd_call
-StableDiffusionPipeline.__call__ = esd_sd_call
+from utils.sana_utils import esd_sana_call
+SanaPipeline.__call__ = esd_sana_call
 
-def load_sd_models(basemodel_id="CompVis/stable-diffusion-v1-4", torch_dtype=torch.bfloat16, device='cuda:0'):
+def load_sana_models(basemodel_id="Efficient-Large-Model/SANA_Sprint_0.6B_1024px_teacher_diffusers", torch_dtype=torch.bfloat16, device='cuda:0'):
+    print(f"Loading {basemodel_id}")
+    pipe = SanaPipeline.from_pretrained(basemodel_id, torch_dtype=torch_dtype, use_safetensors=True).to(device)
     
-    base_unet = UNet2DConditionModel.from_pretrained(basemodel_id, subfolder="unet").to(device, torch_dtype)
-    base_unet.requires_grad_(False)
+    esd_transformer = SanaTransformer2DModel.from_pretrained(basemodel_id, subfolder="transformer").to(device, torch_dtype)
     
-    esd_unet = UNet2DConditionModel.from_pretrained(basemodel_id, subfolder="unet").to(device, torch_dtype)
-    pipe = StableDiffusionPipeline.from_pretrained(basemodel_id, unet=base_unet, torch_dtype=torch_dtype, use_safetensors=True).to(device)
-    
-    return pipe, base_unet, esd_unet
+    base_transformer = pipe.transformer
+    base_transformer.requires_grad_(False)
 
-def get_esd_trainable_parameters(esd_unet, train_method='esd-x'):
+    return pipe, base_transformer, esd_transformer
+
+def get_esd_trainable_parameters(esd_transformer, train_method='esd-u'):
     esd_params = []
     esd_param_names = []
-    for name, module in esd_unet.named_modules():
+    for name, module in esd_transformer.named_modules():
         if module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
-            if train_method == 'esd-x' and 'attn2' in name:
+            if train_method == 'esd-x' and 'attn2' in name: # <--- Default
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
                     
-            if train_method == 'esd-u' and ('attn2' not in name):
+            if train_method == 'esd-u' and ('attn2' not in name): # <--- The authors suggest using this when erasing a general concept like Nudity
+                # In Transformer2DModel, the attn2 is the cross attention layer too
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
@@ -49,19 +52,18 @@ def get_esd_trainable_parameters(esd_unet, train_method='esd-x'):
     return esd_param_names, esd_params
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-                    prog = 'TrainESD for SDv1.4',
-                    description = 'Finetuning stable-diffusion to erase the concepts')
+                    prog = 'TrainESD for Sana Sprint Teacher')
     parser.add_argument('--erase_concept', help='concept to erase', type=str, required=True)
     parser.add_argument('--erase_from', help='target concept to erase from', type=str, required=False, default = None)
-    parser.add_argument('--num_inference_steps', help='number of inference steps for diffusion model', type=int, required=False, default=50)
-    parser.add_argument('--guidance_scale', help='guidance scale to run inference for diffusion model', type=float, required=False, default=3)
+    parser.add_argument('--num_inference_steps', help='number of inference steps for diffusion model', type=int, required=False, default=20)
+    parser.add_argument('--guidance_scale', help='guidance scale to run inference for diffusion model', type=float, required=False, default=4.5)
     
-    parser.add_argument('--train_method', help='Type of method (esd-x, esd-u, esd-a, esd-x-strict)', type=str, required=True)
-    parser.add_argument('--iterations', help='Number of iterations', type=int, default=200)
+    parser.add_argument('--train_method', help='Type of method (esd-x, esd-u, esd-a, esd-x-strict)', type=str, required=True, default='esd-u')
+    parser.add_argument('--iterations', help='Number of ESD iterations', type=int, default=200)
     parser.add_argument('--lr', help='Learning rate', type=float, default=5e-5)
-    parser.add_argument('--negative_guidance', help='Negative guidance value', type=float, required=False, default=2)
-    parser.add_argument('--save_path', help='Path to save model', type=str, default='esd-models/sd/')
-    parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda:0')
+    parser.add_argument('--negative_guidance', help='Negative guidance value for ESD', type=float, required=False, default=2)
+    parser.add_argument('--save_path', help='Path to save model', type=str, default='esd_models/sana_sprint_teacher/')
+    parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda')
 
     args = parser.parse_args()
 
@@ -84,16 +86,18 @@ if __name__ == '__main__':
     
     criteria = torch.nn.MSELoss()
 
-    pipe, base_unet, esd_unet = load_sd_models(basemodel_id="CompVis/stable-diffusion-v1-4", torch_dtype=torch_dtype, device=device)
+    print(f"Will erase {erase_concept}")
+
+    pipe, base_transformer, esd_transformer = load_sana_models(basemodel_id="Efficient-Large-Model/SANA_Sprint_0.6B_1024px_teacher_diffusers", torch_dtype=torch_dtype, device=device)
     pipe.set_progress_bar_config(disable=True)
     pipe.scheduler.set_timesteps(num_inference_steps)
 
-    esd_param_names, esd_params = get_esd_trainable_parameters(esd_unet, train_method=train_method)
+    esd_param_names, esd_params = get_esd_trainable_parameters(esd_transformer, train_method=train_method)
     optimizer = torch.optim.Adam(esd_params, lr=lr)
 
     with torch.no_grad():
         # get prompt embeds
-        erase_embeds, null_embeds = pipe.encode_prompt(prompt=erase_concept,
+        erase_embeds, _erase_embeds_mask, null_embeds, _null_embeds_attn_mask = pipe.encode_prompt(prompt=erase_concept,
                                                        device=device,
                                                        num_images_per_prompt=batchsize,
                                                        do_classifier_free_guidance=True,
@@ -102,12 +106,13 @@ if __name__ == '__main__':
         erase_embeds = erase_embeds.to(device)
         null_embeds = null_embeds.to(device)
         
-        timestep_cond = None
-        if pipe.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(batchsize)
-            timestep_cond = pipe.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=pipe.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=torch_dtype)
+        ## Isn't implemented in Sana
+        # timestep_cond = None
+        # if pipe.unet.config.time_cond_proj_dim is not None:
+        #     guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(batchsize)
+        #     timestep_cond = pipe.get_guidance_scale_embedding(
+        #         guidance_scale_tensor, embedding_dim=pipe.unet.config.time_cond_proj_dim
+        #     ).to(device=device, dtype=torch_dtype)
         
         if erase_concept_from is not None:
             erase_from_embeds, _ = pipe.encode_prompt(prompt=erase_concept_from,
@@ -117,16 +122,17 @@ if __name__ == '__main__':
                                                                 negative_prompt="",
                                                                 )
             erase_from_embeds = erase_from_embeds.to(device)
-    
+
     
     pbar = tqdm(range(iterations), desc='Training ESD')
     losses = []
     for iteration in pbar:
         optimizer.zero_grad()
         # get the noise predictions for erase concept
-        pipe.unet = base_unet
+        pipe.transformer = base_transformer
         run_till_timestep = random.randint(0, num_inference_steps-1)
         run_till_timestep_scheduler = pipe.scheduler.timesteps[run_till_timestep]
+        run_till_timestep_scheduler = torch.tensor([run_till_timestep_scheduler], dtype=torch_dtype, device=device)
         seed = random.randint(0, 2**15)
         with torch.no_grad():
             xt = pipe(erase_concept if erase_concept_from is None else erase_concept_from,
@@ -138,52 +144,44 @@ if __name__ == '__main__':
                   output_type='latent',
                   height=height,
                   width=width,
-                 ).images
+                 ).images.to(device, torch_dtype)
     
-            noise_pred_erase = pipe.unet(
+            noise_pred_erase = pipe.transformer(
                 xt,
-                run_till_timestep_scheduler,
+                timestep=run_till_timestep_scheduler,
                 encoder_hidden_states=erase_embeds,
-                timestep_cond=timestep_cond,
-                cross_attention_kwargs=None,
-                added_cond_kwargs=None,
+                attention_kwargs=None,
                 return_dict=False,
             )[0]
             
             # get the noise predictions for null embeds
-            noise_pred_null = pipe.unet(
+            noise_pred_null = pipe.transformer(
                 xt,
-                run_till_timestep_scheduler,
+                timestep=run_till_timestep_scheduler,
                 encoder_hidden_states=null_embeds,
-                timestep_cond=timestep_cond,
-                cross_attention_kwargs=None,
-                added_cond_kwargs=None,
+                attention_kwargs=None,
                 return_dict=False,
             )[0]
             
             # get the noise predictions for erase concept from embeds
             if erase_concept_from is not None:
-                noise_pred_erase_from = pipe.unet(
+                noise_pred_erase_from = pipe.transformer(
                     xt,
-                    run_till_timestep_scheduler,
+                    timestep=run_till_timestep_scheduler,
                     encoder_hidden_states=erase_from_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=None,
-                    added_cond_kwargs=None,
+                    attention_kwargs=None,
                     return_dict=False,
                 )[0]
             else:
                 noise_pred_erase_from = noise_pred_erase
         
         
-        pipe.unet = esd_unet
-        noise_pred_esd_model = pipe.unet(
+        pipe.transformer = esd_transformer
+        noise_pred_esd_model = pipe.transformer(
             xt,
-            run_till_timestep_scheduler,
+            timestep=run_till_timestep_scheduler,
             encoder_hidden_states=erase_embeds if erase_concept_from is None else erase_from_embeds,
-            timestep_cond=timestep_cond,
-            cross_attention_kwargs=None,
-            added_cond_kwargs=None,
+            attention_kwargs=None,
             return_dict=False,
         )[0]
         

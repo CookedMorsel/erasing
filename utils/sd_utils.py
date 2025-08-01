@@ -64,9 +64,12 @@ def esd_sd_call(
         Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
     ] = None,
     callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+
+    # New params not present in original __call__ function:
     run_from_timestep=0,
     run_till_timestep=None,
     start_latents=None,
+    
     **kwargs,
 ):
     r"""
@@ -206,9 +209,17 @@ def esd_sd_call(
         ).to(device=device, dtype=latents.dtype)
 
     # 7. Denoising loop
+
+    # THIS IS THE ONLY CODE THAT DOESNT APPEAR IN THE ORIGINAL SD FUNC:
+    ### FROM HERE ########################################
+    ################################################################################
     timesteps = timesteps[run_from_timestep: run_till_timestep]
     if start_latents is not None:
         latents = start_latents
+    ################################################################################
+    ### TO HERE ########################################
+    # EVERYTHING ELSE IS IDENTICAL
+
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     self._num_timesteps = len(timesteps)
     with self.progress_bar(total=num_inference_steps) as progress_bar:
