@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from diffusers import SanaPipeline
 from diffusers.models import SanaTransformer2DModel
 import argparse
+import wandb
 
 sys.path.append('.')
 from utils.sana_utils import esd_sana_call
@@ -60,12 +61,21 @@ if __name__ == '__main__':
     
     parser.add_argument('--train_method', help='Type of method (esd-x, esd-u, esd-a, esd-x-strict)', type=str, required=True, default='esd-u')
     parser.add_argument('--iterations', help='Number of ESD iterations', type=int, default=200)
-    parser.add_argument('--lr', help='Learning rate', type=float, default=5e-5)
+    parser.add_argument('--lr', help='Learning rate', type=float, default=2e-4) # 1e-3 too much, 5e-3 too little
     parser.add_argument('--negative_guidance', help='Negative guidance value for ESD', type=float, required=False, default=2)
     parser.add_argument('--save_path', help='Path to save model', type=str, default='esd_models/sana_sprint_teacher/')
     parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda')
+    parser.add_argument('--wandb_project', help='wandb project name', type=str, required=False, default=None)
+    parser.add_argument('--wandb_run_name', help='wandb run name', type=str, required=False, default=None)
 
     args = parser.parse_args()
+
+    if args.wandb_project is not None:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args)
+        )
 
     erase_concept = args.erase_concept
     erase_concept_from = args.erase_from
@@ -82,11 +92,12 @@ if __name__ == '__main__':
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
     device = args.device
-    torch_dtype = torch.bfloat16
+    torch_dtype = torch.bfloat16 # TODO: Is bf16 problematic for fine-tuning? Check fp32 if fine-tuned model is bad
     
     criteria = torch.nn.MSELoss()
 
     print(f"Will erase {erase_concept}")
+    print(f"Using lr = {lr}")
 
     pipe, base_transformer, esd_transformer = load_sana_models(basemodel_id="Efficient-Large-Model/SANA_Sprint_0.6B_1024px_teacher_diffusers", torch_dtype=torch_dtype, device=device)
     pipe.set_progress_bar_config(disable=True)
@@ -192,6 +203,13 @@ if __name__ == '__main__':
         pbar.set_postfix(esd_loss=loss.item(),
                          timestep=run_till_timestep,)
         optimizer.step()
+        
+        if args.wandb_project is not None:
+            wandb.log({
+                "loss": loss.item(),
+                "iteration": iteration,
+                "timestep": run_till_timestep
+            })
     
     esd_param_dict = {}
     for name, param in zip(esd_param_names, esd_params):
@@ -199,4 +217,6 @@ if __name__ == '__main__':
     if erase_concept_from is None:
         erase_concept_from = erase_concept
         
-    save_file(esd_param_dict, f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from.replace(' ', '_')}-{train_method.replace('-','')}.safetensors")
+    save_file(esd_param_dict, f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from.replace(' ', '_')}-{train_method.replace('-','')}-lr-{lr:.6f}-iter-{iterations}.safetensors")
+    # if args.wandb_project is not None:
+    #     wandb.save(f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from.replace(' ', '_')}-{train_method.replace('-','')}.safetensors")

@@ -60,7 +60,7 @@ if __name__ == '__main__':
     parser.add_argument('--iterations', help='Number of iterations', type=int, default=200)
     parser.add_argument('--lr', help='Learning rate', type=float, default=5e-5)
     parser.add_argument('--negative_guidance', help='Negative guidance value', type=float, required=False, default=2)
-    parser.add_argument('--save_path', help='Path to save model', type=str, default='esd-models/sd/')
+    parser.add_argument('--save_path', help='Path to save model', type=str, default='esd_models/sd/')
     parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda:0')
 
     args = parser.parse_args()
@@ -201,4 +201,4 @@ if __name__ == '__main__':
     if erase_concept_from is None:
         erase_concept_from = erase_concept
         
-    save_file(esd_param_dict, f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from.replace(' ', '_')}-{train_method.replace('-','')}.safetensors")
+    save_file(esd_param_dict, f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from.replace(' ', '_')}-{train_method.replace('-','')}-lr-{lr:.6f}-iter-{iterations}.safetensors")
