@@ -27,30 +27,40 @@ def load_sana_models(basemodel_id="Efficient-Large-Model/SANA_Sprint_0.6B_1024px
 def get_esd_trainable_parameters(esd_transformer, train_method='esd-u'):
     esd_params = []
     esd_param_names = []
+    total_params_count = 0 
     for name, module in esd_transformer.named_modules():
+        module: torch.Module
         if module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
             if train_method == 'esd-x' and 'attn2' in name: # <--- Default
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
+                    total_params_count += int(p.numel())
                     
             if train_method == 'esd-u' and ('attn2' not in name): # <--- The authors suggest using this when erasing a general concept like Nudity
                 # In Transformer2DModel, the attn2 is the cross attention layer too
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
+                    total_params_count += int(p.numel())
                     
             if train_method == 'esd-all' :
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
+                    total_params_count += int(p.numel())
                     
             if train_method == 'esd-x-strict' and ('attn2.to_k' in name or 'attn2.to_v' in name):
                 for n, p in module.named_parameters():
                     esd_param_names.append(name+'.'+n)
                     esd_params.append(p)
+                    total_params_count += int(p.numel())
+
+    print(f"Will tune a total of {len(esd_param_names)} modules")
+    print(f"Will tune a total of {total_params_count:,} parameters")
 
     return esd_param_names, esd_params
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
                     prog = 'TrainESD for Sana Sprint Teacher')
@@ -61,7 +71,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--train_method', help='Type of method (esd-x, esd-u, esd-a, esd-x-strict)', type=str, required=True, default='esd-u')
     parser.add_argument('--iterations', help='Number of ESD iterations', type=int, default=200)
-    parser.add_argument('--lr', help='Learning rate', type=float, default=2e-4) # 1e-3 too much, 5e-3 too little
+    parser.add_argument('--lr', help='Learning rate', type=float, default=3e-5)
     parser.add_argument('--negative_guidance', help='Negative guidance value for ESD', type=float, required=False, default=2)
     parser.add_argument('--save_path', help='Path to save model', type=str, default='esd_models/sana_sprint_teacher/')
     parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda')
@@ -84,6 +94,7 @@ if __name__ == '__main__':
     
     guidance_scale = args.guidance_scale
     negative_guidance = args.negative_guidance
+    print(f"Using negative guidance {negative_guidance}")
     train_method=args.train_method
     iterations = args.iterations
     batchsize = 1
@@ -97,6 +108,7 @@ if __name__ == '__main__':
     criteria = torch.nn.MSELoss()
 
     print(f"Will erase {erase_concept}")
+    print(f"Will erase {erase_concept} form {erase_concept_from}")
     print(f"Using lr = {lr}")
 
     pipe, base_transformer, esd_transformer = load_sana_models(basemodel_id="Efficient-Large-Model/SANA_Sprint_0.6B_1024px_teacher_diffusers", torch_dtype=torch_dtype, device=device)
@@ -104,11 +116,13 @@ if __name__ == '__main__':
     pipe.scheduler.set_timesteps(num_inference_steps)
 
     esd_param_names, esd_params = get_esd_trainable_parameters(esd_transformer, train_method=train_method)
+    assert len(esd_params) > 0, f"No params selected for {train_method=}"
+
     optimizer = torch.optim.Adam(esd_params, lr=lr)
 
     with torch.no_grad():
         # get prompt embeds
-        erase_embeds, _erase_embeds_mask, null_embeds, _null_embeds_attn_mask = pipe.encode_prompt(prompt=erase_concept,
+        erase_embeds, erase_embeds_attn_mask, null_embeds, null_embeds_attn_mask = pipe.encode_prompt(prompt=erase_concept,
                                                        device=device,
                                                        num_images_per_prompt=batchsize,
                                                        do_classifier_free_guidance=True,
@@ -126,7 +140,7 @@ if __name__ == '__main__':
         #     ).to(device=device, dtype=torch_dtype)
         
         if erase_concept_from is not None:
-            erase_from_embeds, _ = pipe.encode_prompt(prompt=erase_concept_from,
+            erase_from_embeds, erase_from_embeds_attn_mask = pipe.encode_prompt(prompt=erase_concept_from,
                                                                 device=device,
                                                                 num_images_per_prompt=batchsize,
                                                                 do_classifier_free_guidance=False,
@@ -142,8 +156,19 @@ if __name__ == '__main__':
         # get the noise predictions for erase concept
         pipe.transformer = base_transformer
         run_till_timestep = random.randint(0, num_inference_steps-1)
-        run_till_timestep_scheduler = pipe.scheduler.timesteps[run_till_timestep]
-        run_till_timestep_scheduler = torch.tensor([run_till_timestep_scheduler], dtype=torch_dtype, device=device)
+
+
+        # This SD timestep code isn't accurate since SANA scales the timestep
+        # run_till_timestep_scheduler = pipe.scheduler.timesteps[run_till_timestep]
+        # run_till_timestep_scheduler = torch.tensor([run_till_timestep_scheduler], dtype=torch_dtype, device=device)
+
+        # Correct impl with timestep scaling
+        t_raw = pipe.scheduler.timesteps[run_till_timestep]
+        t_raw = torch.tensor([t_raw], dtype=torch_dtype, device=device)
+        run_till_timestep_scheduler = t_raw * getattr(pipe.transformer.config, "timestep_scale", 1.0)
+        print(f"transformer timestep scale is: {getattr(pipe.transformer.config, 'timestep_scale', 1.0)}")
+
+
         seed = random.randint(0, 2**15)
         with torch.no_grad():
             xt = pipe(erase_concept if erase_concept_from is None else erase_concept_from,
@@ -161,6 +186,7 @@ if __name__ == '__main__':
                 xt,
                 timestep=run_till_timestep_scheduler,
                 encoder_hidden_states=erase_embeds,
+                encoder_attention_mask=erase_embeds_attn_mask,
                 attention_kwargs=None,
                 return_dict=False,
             )[0]
@@ -170,6 +196,7 @@ if __name__ == '__main__':
                 xt,
                 timestep=run_till_timestep_scheduler,
                 encoder_hidden_states=null_embeds,
+                encoder_attention_mask=null_embeds_attn_mask,
                 attention_kwargs=None,
                 return_dict=False,
             )[0]
@@ -180,6 +207,7 @@ if __name__ == '__main__':
                     xt,
                     timestep=run_till_timestep_scheduler,
                     encoder_hidden_states=erase_from_embeds,
+                    encoder_attention_mask=erase_from_embeds_attn_mask,
                     attention_kwargs=None,
                     return_dict=False,
                 )[0]
@@ -192,6 +220,7 @@ if __name__ == '__main__':
             xt,
             timestep=run_till_timestep_scheduler,
             encoder_hidden_states=erase_embeds if erase_concept_from is None else erase_from_embeds,
+            encoder_attention_mask=erase_embeds_attn_mask,
             attention_kwargs=None,
             return_dict=False,
         )[0]
